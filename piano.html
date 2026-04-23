@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Strict Fold MIDI Viewer</title>
+    <!-- Tone.js & MIDI Parser -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <script src="https://unpkg.com/@tonejs/midi"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            margin: 0;
+            background-color: #020617;
+            color: white;
+            overflow: hidden;
+            font-family: 'Pretendard', system-ui, -apple-system, sans-serif;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        .playhead {
+            position: absolute;
+            left: 140px;
+            top: 0;
+            bottom: 0;
+            width: 2px;
+            background: linear-gradient(to bottom, transparent, #60a5fa, transparent);
+            box-shadow: 0 0 20px #3b82f6;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        #loading-overlay {
+            background: rgba(2, 6, 23, 0.95);
+            transition: opacity 0.5s ease-out;
+        }
+
+        .glass {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- Loading Screen -->
+    <div id="loading-overlay" class="fixed inset-0 flex items-center justify-center z-50">
+        <div class="text-center">
+            <div class="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4">
+            </div>
+            <p class="text-lg font-medium" id="status-text">Piano Samples Loading...</p>
+        </div>
+    </div>
+
+    <div class="playhead"></div>
+
+    <!-- Control UI -->
+    <div class="fixed top-6 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-4 w-full max-w-md">
+        <div class="glass p-4 rounded-2xl flex gap-3 w-full justify-center shadow-2xl">
+            <input type="file" id="midiInput" accept=".mid,.midi" class="hidden">
+            <label for="midiInput"
+                class="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg cursor-pointer transition-colors text-sm font-semibold">
+                IMPORT MIDI
+            </label>
+            <button id="playBtn"
+                class="px-6 py-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg font-bold shadow-lg transition-all"
+                disabled>
+                PLAY
+            </button>
+        </div>
+        <p id="file-info" class="text-xs text-slate-400 font-mono"></p>
+    </div>
+
+    <canvas id="canvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const playBtn = document.getElementById('playBtn');
+        const midiInput = document.getElementById('midiInput');
+        const statusText = document.getElementById('status-text');
+        const loadingOverlay = document.getElementById('loading-overlay');
+        const fileInfo = document.getElementById('file-info');
+
+        // Configuration
+        const PLAYHEAD_X = 140;
+        const SPEED = 250;
+        const NOTE_HEIGHT_RATIO = 0.5; // 노트 높이 비율 조정 (0.5 = 절반)
+        const NOTE_PADDING = 2;
+
+        // State
+        let isPlaying = false;
+        let startTime = 0;
+        let notes = [];
+        let uniquePitches = []; // 존재하는 피치들만 저장 (Strict Fold용)
+        let pitchToYMap = new Map();
+
+        // 1. Setup Piano Sampler
+        const sampler = new Tone.Sampler({
+            urls: {
+                "A0": "A0.mp3", "C1": "C1.mp3", "D#1": "Ds1.mp3", "F#1": "Fs1.mp3",
+                "A1": "A1.mp3", "C2": "C2.mp3", "D#2": "Ds2.mp3", "F#2": "Fs2.mp3",
+                "A2": "A2.mp3", "C3": "C3.mp3", "D#3": "Ds3.mp3", "F#3": "Fs3.mp3",
+                "A3": "A3.mp3", "C4": "C4.mp3", "D#4": "Ds4.mp3", "F#4": "Fs4.mp3",
+                "A4": "A4.mp3", "C5": "C5.mp3", "D#5": "Ds5.mp3", "F#5": "Fs5.mp3",
+                "A5": "A5.mp3", "C6": "C6.mp3", "D#6": "Ds6.mp3", "F#6": "Fs6.mp3",
+                "A6": "A6.mp3", "C7": "C7.mp3", "D#7": "Ds7.mp3", "F#7": "Fs7.mp3",
+                "A7": "A7.mp3", "C8": "C8.mp3"
+            },
+            release: 1.5,
+            baseUrl: "https://tonejs.github.io/audio/salamander/",
+            onload: () => {
+                statusText.innerText = "Select a MIDI file to start";
+                loadingOverlay.style.opacity = '0';
+                setTimeout(() => loadingOverlay.classList.add('hidden'), 500);
+            }
+        }).toDestination();
+
+        // 2. MIDI File Handling
+        midiInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            fileInfo.innerText = `Parsing: ${file.name}...`;
+            const arrayBuffer = await file.arrayBuffer();
+            const midi = new Midi(arrayBuffer);
+
+            const newNotes = [];
+            const pitchSet = new Set();
+
+            midi.tracks.forEach(track => {
+                track.notes.forEach(note => {
+                    newNotes.push({
+                        pitch: note.midi,
+                        name: note.name,
+                        time: note.time,
+                        duration: note.duration,
+                        velocity: note.velocity
+                    });
+                    pitchSet.add(note.midi);
+                });
+            });
+
+            if (newNotes.length > 0) {
+                notes = newNotes.sort((a, b) => a.time - b.time);
+
+                // Strict Fold Logic
+                uniquePitches = Array.from(pitchSet).sort((a, b) => a - b);
+
+                updateYMapping();
+
+                fileInfo.innerText = `${file.name} loaded. Unique notes: ${uniquePitches.length}`;
+                playBtn.disabled = false;
+                playBtn.innerText = "START PERFORMANCE";
+                isPlaying = false;
+            }
+        });
+
+        function updateYMapping() {
+            if (uniquePitches.length === 0) return;
+            pitchToYMap.clear();
+
+            const count = uniquePitches.length;
+            // 여유 공간을 더 많이 확보하기 위해 전체 캔버스를 더 잘게 나눔
+            const step = canvas.height / (count + 1);
+
+            uniquePitches.forEach((pitch, index) => {
+                const y = canvas.height - (step * (index + 1));
+                pitchToYMap.set(pitch, y);
+            });
+        }
+
+        // 3. Rendering Logic
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            updateYMapping();
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        function draw() {
+            ctx.fillStyle = '#020617';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            if (uniquePitches.length === 0) {
+                requestAnimationFrame(draw);
+                return;
+            }
+
+            // 한 음이 차지할 수 있는 최대 영역
+            const slotHeight = canvas.height / (uniquePitches.length + 1);
+            // 실제 노트의 높이를 절반으로 설정
+            const noteDisplayHeight = slotHeight * NOTE_HEIGHT_RATIO;
+            const currentTime = isPlaying ? (Tone.now() - startTime) : 0;
+
+            // Draw horizontal guide lines
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.03)';
+            ctx.lineWidth = 1;
+            uniquePitches.forEach(pitch => {
+                const y = pitchToYMap.get(pitch);
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(canvas.width, y);
+                ctx.stroke();
+            });
+
+            // Draw Notes
+            notes.forEach(note => {
+                const x = PLAYHEAD_X + (note.time - currentTime) * SPEED;
+                const width = note.duration * SPEED;
+                const y = pitchToYMap.get(note.pitch);
+
+                if (x + width > 0 && x < canvas.width) {
+                    const isActive = isPlaying && currentTime >= note.time && currentTime <= note.time + note.duration;
+
+                    if (isActive) {
+                        ctx.shadowBlur = 10;
+                        ctx.shadowColor = '#3b82f6';
+                        ctx.fillStyle = '#60a5fa';
+                    } else {
+                        ctx.shadowBlur = 0;
+                        ctx.fillStyle = '#1e293b';
+                    }
+
+                    // Note Rectangle (두께가 절반으로 줄어듦)
+                    ctx.beginPath();
+                    ctx.roundRect(
+                        x,
+                        y - (noteDisplayHeight / 2),
+                        width - 1,
+                        noteDisplayHeight,
+                        2
+                    );
+                    ctx.fill();
+
+                    // Sound Name Text
+                    if (isActive || width > 50) {
+                        ctx.shadowBlur = 0;
+                        ctx.fillStyle = isActive ? 'white' : 'rgba(255,255,255,0.4)';
+                        // 글자 크기도 노트 높이에 맞춤
+                        const fontSize = Math.max(8, Math.min(noteDisplayHeight * 1.2, 14));
+                        ctx.font = `bold ${fontSize}px monospace`;
+                        ctx.textAlign = 'left';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(note.name, x + 8, y);
+                    }
+                }
+            });
+
+            requestAnimationFrame(draw);
+        }
+
+        // 4. Playback
+        playBtn.addEventListener('click', async () => {
+            if (isPlaying) {
+                Tone.Transport.stop();
+                sampler.releaseAll();
+                isPlaying = false;
+                playBtn.innerText = "RESUME";
+                return;
+            }
+
+            await Tone.start();
+            startTime = Tone.now();
+            isPlaying = true;
+            playBtn.innerText = "STOP";
+
+            notes.forEach(note => {
+                sampler.triggerAttackRelease(
+                    note.name,
+                    note.duration,
+                    startTime + note.time,
+                    note.velocity
+                );
+            });
+        });
+
+        draw();
+    </script>
+</body>
+
+</html>
